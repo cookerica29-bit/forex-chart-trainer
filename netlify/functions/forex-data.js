@@ -1,6 +1,6 @@
 // netlify/functions/forex-data.js
-// Serverless proxy that fetches OHLC candles from a primary provider (Yahoo Finance)
-// and falls back to a secondary provider (Stooq) if Yahoo is unavailable or rate-limits.
+// Live OHLC proxy. Primary provider: Twelve Data (requires TWELVE_DATA_API_KEY env var).
+// Optional fallbacks: Yahoo Finance, Stooq (kept for resilience).
 // Returns { symbol, interval, candles: [{ time, open, high, low, close }], source }
 
 const ALLOWED_SYMBOLS = new Set([
@@ -14,7 +14,6 @@ const ALLOWED_SYMBOLS = new Set([
 const ALLOWED_INTERVALS = new Set(["5m", "15m", "30m", "60m", "1h", "4h", "1d"]);
 
 // In-memory cache (per warm Lambda instance). Keys are symbol|interval.
-// Entries expire after CACHE_TTL_MS.
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const cache = new Map();
 
@@ -59,11 +58,19 @@ function aggregateTo4h(candles) {
   return out;
 }
 
-function formatTime(unixSeconds) {
+function formatTimeFromUnix(unixSeconds) {
   const d = new Date(unixSeconds * 1000);
   const hh = String(d.getUTCHours()).padStart(2, "0");
   const mm = String(d.getUTCMinutes()).padStart(2, "0");
   return hh + ":" + mm;
+}
+
+// Twelve Data datetime is "YYYY-MM-DD HH:MM:SS" (intraday) or "YYYY-MM-DD" (daily).
+function formatTimeFromTwelveData(datetime) {
+  if (!datetime) return "";
+  const t = String(datetime).trim();
+  if (t.length >= 16 && t.indexOf(" ") === 10) return t.slice(11, 16); // HH:MM
+  return t.slice(0, 10); // date
 }
 
 const BROWSER_HEADERS = {
@@ -72,7 +79,79 @@ const BROWSER_HEADERS = {
   "Accept-Language": "en-US,en;q=0.9",
 };
 
-// ----------------------- Yahoo provider -----------------------
+// ----------------------- Twelve Data (PRIMARY) -----------------------
+// API: https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=15min&outputsize=240&apikey=KEY
+const TWELVE_SYMBOL = {
+  "EURUSD=X": "EUR/USD",
+  "GBPUSD=X": "GBP/USD",
+  "USDJPY=X": "USD/JPY",
+  "GBPJPY=X": "GBP/JPY",
+  "XAUUSD=X": "XAU/USD",
+  "GC=F":     "XAU/USD", // map gold futures to spot gold pair on Twelve Data
+};
+function twelveInterval(interval) {
+  if (interval === "5m") return "5min";
+  if (interval === "15m") return "15min";
+  if (interval === "30m") return "30min";
+  if (interval === "60m" || interval === "1h") return "1h";
+  if (interval === "4h") return "4h";
+  return "1day";
+}
+
+async function fetchTwelveData(symbol, interval, apiKey) {
+  const tdSymbol = TWELVE_SYMBOL[symbol];
+  if (!tdSymbol) {
+    return { error: { stage: "twelvedata-mapping", message: "No Twelve Data symbol mapped for " + symbol } };
+  }
+  const tdInterval = twelveInterval(interval);
+  const url = "https://api.twelvedata.com/time_series" +
+    "?symbol=" + encodeURIComponent(tdSymbol) +
+    "&interval=" + encodeURIComponent(tdInterval) +
+    "&outputsize=240" +
+    "&format=JSON" +
+    "&apikey=" + encodeURIComponent(apiKey);
+  try {
+    const res = await fetch(url, { headers: BROWSER_HEADERS });
+    const text = await res.text();
+    if (!res.ok) {
+      return { error: { stage: "twelvedata-status", status: res.status, bodySnippet: text.slice(0, 200) } };
+    }
+    let json;
+    try { json = JSON.parse(text); } catch (e) {
+      return { error: { stage: "twelvedata-parse", message: String(e && e.message), bodySnippet: text.slice(0, 200) } };
+    }
+    // Twelve Data signals errors with status: "error"
+    if (json && json.status === "error") {
+      return { error: { stage: "twelvedata-api-error", code: json.code, message: json.message || "Twelve Data error" } };
+    }
+    const values = json && json.values;
+    if (!Array.isArray(values) || values.length === 0) {
+      return { error: { stage: "twelvedata-empty", message: "No values returned", bodySnippet: text.slice(0, 200) } };
+    }
+    // Twelve Data returns newest-first; reverse to chronological.
+    const ordered = values.slice().reverse();
+    const candles = [];
+    for (const row of ordered) {
+      const o = Number(row.open);
+      const h = Number(row.high);
+      const l = Number(row.low);
+      const c = Number(row.close);
+      if ([o, h, l, c].some((v) => !isFinite(v))) continue;
+      candles.push({
+        time: formatTimeFromTwelveData(row.datetime),
+        open: o, high: h, low: l, close: c,
+      });
+    }
+    if (candles.length === 0) {
+      return { error: { stage: "twelvedata-no-usable-rows" } };
+    }
+    return { candles };
+  } catch (e) {
+    return { error: { stage: "twelvedata-fetch-throw", message: String(e && e.message) } };
+  }
+}
+
+// ----------------------- Yahoo (optional fallback) -----------------------
 async function fetchYahoo(symbol, interval, range) {
   const hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"];
   let lastError = null;
@@ -124,23 +203,22 @@ function yahooToCandles(json) {
     const o = opens[i], h = highs[i], l = lows[i], c = closes[i];
     if (o == null || h == null || l == null || c == null) continue;
     candles.push({
-      time: formatTime(ts[i]),
+      time: formatTimeFromUnix(ts[i]),
       open: Number(o), high: Number(h), low: Number(l), close: Number(c),
     });
   }
   return candles;
 }
 
-// ----------------------- Stooq provider (fallback) -----------------------
+// ----------------------- Stooq (optional fallback) -----------------------
 const STOOQ_SYMBOL = {
   "EURUSD=X": "eurusd",
   "GBPUSD=X": "gbpusd",
   "USDJPY=X": "usdjpy",
   "GBPJPY=X": "gbpjpy",
   "XAUUSD=X": "xauusd",
-  "GC=F": "xauusd",
+  "GC=F":     "xauusd",
 };
-
 function stooqInterval(interval) {
   if (interval === "5m") return "5";
   if (interval === "15m") return "15";
@@ -149,7 +227,6 @@ function stooqInterval(interval) {
   if (interval === "4h") return "60";
   return "d";
 }
-
 function parseStooqCsv(text) {
   const lines = text.trim().split(/\r?\n/);
   if (lines.length < 2) return [];
@@ -161,23 +238,19 @@ function parseStooqCsv(text) {
     if (intraday) {
       if (cols.length < 6) continue;
       const time = cols[1];
-      const o = cols[2], h = cols[3], l = cols[4], c = cols[5];
-      const open = Number(o), high = Number(h), low = Number(l), close = Number(c);
-      if ([open, high, low, close].some((v) => !isFinite(v))) continue;
-      const hhmm = (time || "").slice(0, 5);
-      candles.push({ time: hhmm, open, high, low, close });
+      const o = Number(cols[2]), h = Number(cols[3]), l = Number(cols[4]), c = Number(cols[5]);
+      if ([o, h, l, c].some((v) => !isFinite(v))) continue;
+      candles.push({ time: (time || "").slice(0, 5), open: o, high: h, low: l, close: c });
     } else {
       if (cols.length < 5) continue;
       const date = cols[0];
-      const o = cols[1], h = cols[2], l = cols[3], c = cols[4];
-      const open = Number(o), high = Number(h), low = Number(l), close = Number(c);
-      if ([open, high, low, close].some((v) => !isFinite(v))) continue;
-      candles.push({ time: date, open, high, low, close });
+      const o = Number(cols[1]), h = Number(cols[2]), l = Number(cols[3]), c = Number(cols[4]);
+      if ([o, h, l, c].some((v) => !isFinite(v))) continue;
+      candles.push({ time: date, open: o, high: h, low: l, close: c });
     }
   }
   return candles;
 }
-
 async function fetchStooq(symbol, interval) {
   const stooqSym = STOOQ_SYMBOL[symbol];
   if (!stooqSym) {
@@ -191,8 +264,8 @@ async function fetchStooq(symbol, interval) {
     if (!res.ok) {
       return { error: { stage: "stooq-status", status: res.status, bodySnippet: text.slice(0, 200) } };
     }
-    if (!text || text.toLowerCase().includes("no data")) {
-      return { error: { stage: "stooq-empty", bodySnippet: text.slice(0, 200) } };
+    if (!text || text.toLowerCase().includes("no data") || text.toLowerCase().includes("captcha")) {
+      return { error: { stage: "stooq-blocked", bodySnippet: text.slice(0, 200) } };
     }
     const candles = parseStooqCsv(text);
     if (candles.length === 0) {
@@ -228,6 +301,7 @@ exports.handler = async (event) => {
     const params = (event && event.queryStringParameters) || {};
     const symbol = (params.symbol || "EURUSD=X").trim();
     let interval = (params.interval || "15m").trim().toLowerCase();
+    const allowFallback = params.fallback !== "0";
 
     if (!ALLOWED_SYMBOLS.has(symbol)) {
       return fail(400, { error: "Symbol not allowed", symbol, allowed: Array.from(ALLOWED_SYMBOLS) });
@@ -246,50 +320,73 @@ exports.handler = async (event) => {
       };
     }
 
+    const apiKey = process.env.TWELVE_DATA_API_KEY;
+    if (!apiKey) {
+      return fail(500, { error: "Missing TWELVE_DATA_API_KEY" });
+    }
+
     const wants4h = interval === "4h";
     const fetchInterval = wants4h ? "60m" : interval === "1h" ? "60m" : interval;
     const range = pickRangeFor(fetchInterval);
 
-    const yahoo = await fetchYahoo(symbol, fetchInterval, range);
     let candles = null;
     let source = null;
-    let yahooError = null;
+    const providerErrors = {};
 
-    if (yahoo && yahoo.json) {
-      const parsed = yahooToCandles(yahoo.json);
-      if (parsed && parsed.length > 0) {
-        candles = parsed;
-        source = "yahoo:" + yahoo.host;
-      } else {
-        yahooError = { stage: "yahoo-no-candles", host: yahoo.host };
-      }
-    } else if (yahoo && yahoo.error) {
-      yahooError = yahoo.error;
+    // ---- Provider 1: Twelve Data (primary) ----
+    const twelveInt = wants4h ? "4h" : (interval === "1h" || interval === "60m") ? "1h" : interval;
+    const td = await fetchTwelveData(symbol, twelveInt, apiKey);
+    if (td && td.candles && td.candles.length > 0) {
+      candles = td.candles;
+      source = "twelvedata";
+    } else if (td && td.error) {
+      providerErrors.twelvedata = td.error;
     }
 
-    let stooqError = null;
-    if (!candles) {
+    // ---- Provider 2: Yahoo (optional fallback) ----
+    if (!candles && allowFallback) {
+      const yahoo = await fetchYahoo(symbol, fetchInterval, range);
+      if (yahoo && yahoo.json) {
+        const parsed = yahooToCandles(yahoo.json);
+        if (parsed && parsed.length > 0) {
+          candles = parsed;
+          source = "yahoo:" + yahoo.host;
+        } else {
+          providerErrors.yahoo = { stage: "yahoo-no-candles", host: yahoo.host };
+        }
+      } else if (yahoo && yahoo.error) {
+        providerErrors.yahoo = yahoo.error;
+      }
+    }
+
+    // ---- Provider 3: Stooq (optional fallback) ----
+    if (!candles && allowFallback) {
       const stooq = await fetchStooq(symbol, fetchInterval);
       if (stooq && stooq.candles && stooq.candles.length > 0) {
         candles = stooq.candles;
         source = "stooq";
-      } else {
-        stooqError = (stooq && stooq.error) || { stage: "stooq-unknown" };
+      } else if (stooq && stooq.error) {
+        providerErrors.stooq = stooq.error;
       }
     }
 
     if (!candles) {
       return fail(502, {
         error: "All providers failed",
-        yahoo: yahooError,
-        stooq: stooqError,
+        providers: providerErrors,
       });
     }
 
-    if (wants4h) candles = aggregateTo4h(candles);
+    if (wants4h && source !== "twelvedata") candles = aggregateTo4h(candles);
     if (candles.length > 240) candles = candles.slice(candles.length - 240);
 
-    const payload = { symbol, interval, candles, source, yahooError: yahooError || undefined };
+    const payload = {
+      symbol,
+      interval,
+      candles,
+      source,
+      providerErrors: Object.keys(providerErrors).length ? providerErrors : undefined,
+    };
     cacheSet(cacheKey, payload);
 
     return {

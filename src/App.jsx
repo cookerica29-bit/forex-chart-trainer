@@ -495,10 +495,12 @@ export default function ForexChartPractice() {
       if (result && result.error) {
         const err = result.error;
         const summary =
-          err.stage === "function-status" && err.body && err.body.yahoo && err.body.yahoo.status === 429
-            ? "Yahoo rate limited. Backup provider unavailable."
+          err.stage === "function-status" && err.body && err.body.error === "Missing TWELVE_DATA_API_KEY"
+            ? "Missing TWELVE_DATA_API_KEY on the server. Set the env var in Netlify and redeploy."
             : err.stage === "function-status" && err.body && err.body.error === "All providers failed"
-              ? "Backup provider unavailable."
+              ? "All live providers failed. Check API key and provider status."
+              : err.stage === "function-status" && err.body && err.body.providers && err.body.providers.twelvedata
+                ? ("Twelve Data: " + (err.body.providers.twelvedata.message || err.body.providers.twelvedata.stage))
               : err.stage === "function-status"
                 ? "Function returned HTTP " + err.status + " - " + (err.message || "no message")
                 : err.stage === "client-fetch-throw"
@@ -515,9 +517,14 @@ export default function ForexChartPractice() {
         setLiveData(null);
         setLiveSource(null);
       } else if (result && result.candles) {
-        const usingFallback = typeof result.source === "string" && result.source.startsWith("stooq");
+        const usingFallback = typeof result.source === "string" && result.source !== "twelvedata";
         if (usingFallback) {
-          setLiveNotice("Yahoo rate limited. Trying backup provider… loaded from Stooq.");
+          const label = result.source && result.source.startsWith("stooq")
+            ? "Twelve Data unavailable. Loaded from Stooq backup."
+            : result.source && result.source.startsWith("yahoo")
+              ? "Twelve Data unavailable. Loaded from Yahoo backup."
+              : "Twelve Data unavailable. Loaded from backup provider.";
+          setLiveNotice(label);
         } else {
           setLiveNotice(null);
         }
@@ -583,7 +590,7 @@ export default function ForexChartPractice() {
           <div>
             <h1 className="text-3xl md:text-5xl font-bold tracking-tight">Forex Chart Analysis Practice</h1>
             <p className="text-slate-400 mt-2 max-w-2xl">
-              Practice with real Yahoo Finance OHLC data or demo replay. Mark bias, liquidity, structure, POI, entry, invalidation, and target — then reveal the model breakdown and compare against the A+ score engine.
+              Practice with real Twelve Data OHLC candles or demo replay. Mark bias, liquidity, structure, POI, entry, invalidation, and target — then reveal the model breakdown and compare against the A+ score engine.
             </p>
           </div>
           <div className="flex flex-col items-end gap-2">
@@ -598,12 +605,12 @@ export default function ForexChartPractice() {
 
         <Card>
           <div className="mb-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-amber-100">
-            <div className="font-semibold mb-1">Yahoo Finance Live Replay Mode</div>
+            <div className="font-semibold mb-1">Live Replay Mode (Twelve Data)</div>
             <div className="text-xs mt-1 opacity-80">
-              Current mode: {dataMode === "demo" ? "Demo candles" : liveLoading ? "Loading live candles..." : liveError ? "Live mode (error - using demo)" : liveSource ? (liveSource.startsWith("stooq") ? ("Live feed (Stooq backup) — " + liveSource) : ("Live Yahoo Finance feed via " + liveSource)) : "Live Yahoo Finance feed"}
+              Current mode: {dataMode === "demo" ? "Demo candles" : liveLoading ? "Loading live candles..." : liveError ? "Live mode (error - using demo)" : liveSource ? (liveSource === "twelvedata" ? "Live feed (Twelve Data)" : liveSource.startsWith("stooq") ? ("Live feed (Stooq backup) — " + liveSource) : liveSource.startsWith("yahoo") ? ("Live feed (Yahoo backup) — " + liveSource) : ("Live feed — " + liveSource)) : "Live feed"}
             </div>
             <div className="text-sm text-amber-200/90 mt-1">
-              Click "Switch to Live Mode" to load real OHLC candles from /.netlify/functions/forex-data and replay them candle by candle.
+              Click "Switch to Live Mode" to load real OHLC candles from Twelve Data via /.netlify/functions/forex-data and replay them candle by candle.
             </div>
             {liveNotice && !liveError ? (
               <div className="mt-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-amber-200 text-sm">
