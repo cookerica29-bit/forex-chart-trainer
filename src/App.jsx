@@ -31,13 +31,30 @@ function decimalsFor(pair) {
 }
 
 // Returns { candles } on success or { error: { stage, status?, message?, body? } } on failure.
+// Client-side cache for live OHLC fetches (per pair+timeframe).
+// Reduces re-fetches when user toggles modes or clicks the same pair again.
+const LIVE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const liveCache = new Map();
+function liveCacheGet(key) {
+  const e = liveCache.get(key);
+  if (!e) return null;
+  if (Date.now() - e.t > LIVE_CACHE_TTL_MS) { liveCache.delete(key); return null; }
+  return e.v;
+}
+function liveCacheSet(key, value) { liveCache.set(key, { t: Date.now(), v: value }); }
+
 async function fetchYahooFinanceData(pair, timeframe) {
   const symbol = YAHOO_SYMBOL[pair];
   const interval = YAHOO_INTERVAL[timeframe] || "15m";
   if (!symbol) {
     return { error: { stage: "client-mapping", message: "No Yahoo symbol mapped for pair " + pair } };
   }
-  const url = "/.netlify/functions/forex-data?symbol=" + encodeURIComponent(symbol) + "&interval=" + encodeURIComponent(interval);
+  const cacheKey = pair + "|" + timeframe;
+  const cached = liveCacheGet(cacheKey);
+  if (cached) return { ...cached, cached: true };
+
+  const url = "/.netlify/functions/forex-data?symbol=" + encodeURIComponent(symbol) +
+    "&interval=" + encodeURIComponent(interval);
   let res;
   try {
     res = await fetch(url);
@@ -58,9 +75,7 @@ async function fetchYahooFinanceData(pair, timeframe) {
     };
   }
   let json;
-  try {
-    json = JSON.parse(text);
-  } catch (e) {
+  try { json = JSON.parse(text); } catch (e) {
     return { error: { stage: "client-parse", message: String(e && e.message), body: text.slice(0, 300) } };
   }
   if (!json || !Array.isArray(json.candles) || json.candles.length === 0) {
@@ -74,7 +89,9 @@ async function fetchYahooFinanceData(pair, timeframe) {
     low: Number(c.low),
     close: Number(c.close),
   }));
-  return { candles, source: json.source };
+  const result = { candles, source: json.source, yahooError: json.yahooError };
+  liveCacheSet(cacheKey, result);
+  return result;
 }
 
 function makeScenario(pair, session, timeframe, seed = 12) {
@@ -439,6 +456,7 @@ export default function ForexChartPractice() {
   const [liveError, setLiveError] = useState(null);
   const [liveErrorDetail, setLiveErrorDetail] = useState(null);
   const [liveSource, setLiveSource] = useState(null);
+  const [liveNotice, setLiveNotice] = useState(null);
 
   const demoScenario = useMemo(() => makeScenario(pair, session, timeframe, seed), [pair, session, timeframe, seed]);
 
@@ -471,27 +489,38 @@ export default function ForexChartPractice() {
     setLiveLoading(true);
     setLiveError(null);
     setLiveErrorDetail(null);
+    setLiveNotice(null);
     fetchYahooFinanceData(pair, timeframe).then((result) => {
       if (cancelled) return;
       if (result && result.error) {
         const err = result.error;
         const summary =
-          err.stage === "function-status"
-            ? "Function returned HTTP " + err.status + " - " + (err.message || "no message")
-            : err.stage === "client-fetch-throw"
-              ? "Network error: " + (err.message || "fetch failed")
-              : err.stage === "empty-candles"
-                ? "Function responded but no candles were returned"
-                : err.stage === "client-parse"
-                  ? "Function response was not valid JSON"
-                  : err.stage === "client-mapping"
-                    ? err.message
-                    : (err.message || "Unknown live fetch error");
+          err.stage === "function-status" && err.body && err.body.yahoo && err.body.yahoo.status === 429
+            ? "Yahoo rate limited. Backup provider unavailable."
+            : err.stage === "function-status" && err.body && err.body.error === "All providers failed"
+              ? "Backup provider unavailable."
+              : err.stage === "function-status"
+                ? "Function returned HTTP " + err.status + " - " + (err.message || "no message")
+                : err.stage === "client-fetch-throw"
+                  ? "Network error: " + (err.message || "fetch failed")
+                  : err.stage === "empty-candles"
+                    ? "Function responded but no candles were returned"
+                    : err.stage === "client-parse"
+                      ? "Function response was not valid JSON"
+                      : err.stage === "client-mapping"
+                        ? err.message
+                        : (err.message || "Unknown live fetch error");
         setLiveError(summary);
         setLiveErrorDetail(err);
         setLiveData(null);
         setLiveSource(null);
       } else if (result && result.candles) {
+        const usingFallback = typeof result.source === "string" && result.source.startsWith("stooq");
+        if (usingFallback) {
+          setLiveNotice("Yahoo rate limited. Trying backup provider… loaded from Stooq.");
+        } else {
+          setLiveNotice(null);
+        }
         setLiveData(result.candles);
         setLiveSource(result.source || null);
         setVisibleBars(Math.min(62, result.candles.length));
@@ -571,11 +600,17 @@ export default function ForexChartPractice() {
           <div className="mb-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-amber-100">
             <div className="font-semibold mb-1">Yahoo Finance Live Replay Mode</div>
             <div className="text-xs mt-1 opacity-80">
-              Current mode: {dataMode === "demo" ? "Demo candles" : liveLoading ? "Loading live candles..." : liveError ? "Live mode (error - using demo)" : liveSource ? ("Live Yahoo Finance feed via " + liveSource) : "Live Yahoo Finance feed"}
+              Current mode: {dataMode === "demo" ? "Demo candles" : liveLoading ? "Loading live candles..." : liveError ? "Live mode (error - using demo)" : liveSource ? (liveSource.startsWith("stooq") ? ("Live feed (Stooq backup) — " + liveSource) : ("Live Yahoo Finance feed via " + liveSource)) : "Live Yahoo Finance feed"}
             </div>
             <div className="text-sm text-amber-200/90 mt-1">
               Click "Switch to Live Mode" to load real OHLC candles from /.netlify/functions/forex-data and replay them candle by candle.
             </div>
+            {liveNotice && !liveError ? (
+              <div className="mt-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-amber-200 text-sm">
+                <div className="font-semibold mb-1">Backup provider in use</div>
+                <div className="opacity-90">{liveNotice}</div>
+              </div>
+            ) : null}
             {liveError ? (
               <div className="mt-2 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-rose-200 text-sm">
                 <div className="font-semibold mb-1">Live fetch failed</div>
