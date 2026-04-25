@@ -1,0 +1,54 @@
+forex-data.js
+export async function handler(event) {
+  try {
+    const symbol = event.queryStringParameters.symbol || "EURUSD=X";
+
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=15m&range=5d`;
+
+    const response = await fetch(url);
+    const json = await response.json();
+
+    const result = json.chart.result?.[0];
+
+    if (!result) {
+      return {
+        statusCode: 400,
+        body: JSON.stringify({
+          error: "No chart data returned"
+        })
+      };
+    }
+
+    const timestamps = result.timestamp || [];
+    const quote = result.indicators.quote?.[0] || {};
+
+    const candles = timestamps.map((time, i) => ({
+      time,
+      open: quote.open?.[i],
+      high: quote.high?.[i],
+      low: quote.low?.[i],
+      close: quote.close?.[i]
+    })).filter(candle =>
+      candle.open &&
+      candle.high &&
+      candle.low &&
+      candle.close
+    );
+
+    return {
+      statusCode: 200,
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(candles)
+    };
+
+  } catch (error) {
+    return {
+      statusCode: 500,
+      body: JSON.stringify({
+        error: error.message
+      })
+    };
+  }
+}
