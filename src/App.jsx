@@ -3,6 +3,22 @@ import React, { useMemo, useState, useEffect } from "react";
 const PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "GBPJPY"];
 const SESSIONS = ["Asia", "London", "New York"];
 const TIMEFRAMES = ["5m", "15m", "1H", "4H"];
+const DRILLS = [
+  { id: "full", label: "Full Read", fields: ["bias", "trend", "liquidity", "poi", "entry", "invalidation", "target"], focus: "Build the full trade idea from left to right." },
+  { id: "liquidity", label: "Liquidity", fields: ["bias", "liquidity", "target"], focus: "Find the draw on liquidity before thinking about entry." },
+  { id: "structure", label: "Structure", fields: ["bias", "trend", "liquidity"], focus: "Read BOS/CHoCH and decide whether the move is clean." },
+  { id: "poi", label: "POI", fields: ["bias", "liquidity", "poi", "entry"], focus: "Choose the zone worth waiting for, not the first candle that moves." },
+  { id: "execution", label: "Execution", fields: ["entry", "invalidation", "target"], focus: "Practice entry confirmation, invalidation, and logical target selection." },
+];
+const CHECKLIST_FIELDS = [
+  ["bias", "Market bias"],
+  ["trend", "Trend / structure"],
+  ["liquidity", "Liquidity swept or targeted"],
+  ["poi", "POI / zone"],
+  ["entry", "Entry trigger"],
+  ["invalidation", "Invalidation"],
+  ["target", "Target"],
+];
 
 const YAHOO_SYMBOL = {
   EURUSD: "EURUSD=X",
@@ -318,6 +334,39 @@ function scoreSetup({ checklist, scenario, session, timeframe }) {
   return { components, total, grade };
 }
 
+function buildFeedback({ checklist, scenario, score, drillMode }) {
+  const answer = scenario.answer;
+  const modelBullish = answer.bias.toLowerCase().includes("bullish");
+  const userBias = (checklist.bias || "").toLowerCase();
+  const userPoi = (checklist.poi || "").toLowerCase();
+  const userEntry = (checklist.entry || "").toLowerCase();
+  const tips = [];
+
+  if (checklist.bias && score.components.htfBias < 70) {
+    tips.push(modelBullish ? "Bias mismatch: this model read is bullish, so shorts need stronger evidence." : "Bias mismatch: this model read is bearish, so longs need stronger evidence.");
+  }
+  if (checklist.liquidity && score.components.liquidity < 70) {
+    tips.push(modelBullish ? "Liquidity clue: for the long idea, name the sell-side sweep or low that price took first." : "Liquidity clue: for the short idea, name the buy-side sweep or high that price took first.");
+  }
+  if (checklist.poi && score.components.poi < 70) {
+    tips.push(modelBullish ? "POI clue: a cleaner long should study demand or discount after displacement." : "POI clue: a cleaner short should study supply or premium after displacement.");
+  }
+  if (checklist.entry && score.components.entryConfirmation < 70) {
+    tips.push("Entry clue: avoid a market-entry answer; wait for a pullback plus confirmation or displacement.");
+  }
+  if ((checklist.invalidation || checklist.target) && score.components.rrQuality < 70) {
+    tips.push(modelBullish ? "Risk clue: invalidation should live below the swept low, and target should be buy-side liquidity." : "Risk clue: invalidation should live above the swept high, and target should be sell-side liquidity.");
+  }
+
+  if (tips.length === 0) {
+    if (score.total >= 80) tips.push("Strong read. Now ask whether the entry would still look clean in real time.");
+    else if (drillMode !== "full") tips.push("Good start. Add one more specific price-action clue before revealing the answer.");
+    else tips.push("Fill in more of the checklist, then compare your read against the model.");
+  }
+
+  return tips.slice(0, 3);
+}
+
 function gradeBadgeClasses(grade) {
   if (grade === "A+ Setup") return "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30";
   if (grade === "A Setup") return "bg-emerald-500/15 text-emerald-200 border border-emerald-500/25";
@@ -450,6 +499,7 @@ export default function ForexChartPractice() {
   const [showLevels, setShowLevels] = useState(true);
   const [showAnswer, setShowAnswer] = useState(false);
   const [checklist, setChecklist] = useState(blankChecklist);
+  const [drillMode, setDrillMode] = useState("full");
   const [dataMode, setDataMode] = useState("demo");
   const [liveData, setLiveData] = useState(null);
   const [liveLoading, setLiveLoading] = useState(false);
@@ -480,8 +530,11 @@ export default function ForexChartPractice() {
   }, [dataMode, liveData, demoScenario, pair]);
 
   const visibleData = scenario.data.slice(0, visibleBars);
-  const filled = Object.values(checklist).filter(Boolean).length;
   const score = useMemo(() => scoreSetup({ checklist, scenario, session, timeframe }), [checklist, scenario, session, timeframe]);
+  const activeDrill = DRILLS.find((drill) => drill.id === drillMode) || DRILLS[0];
+  const activeFields = CHECKLIST_FIELDS.filter(([field]) => activeDrill.fields.includes(field));
+  const drillFilled = activeDrill.fields.filter((field) => checklist[field]).length;
+  const feedback = useMemo(() => buildFeedback({ checklist, scenario, score, drillMode }), [checklist, scenario, score, drillMode]);
 
   useEffect(() => {
     if (dataMode !== "live") return undefined;
@@ -588,14 +641,14 @@ export default function ForexChartPractice() {
       <div className="max-w-7xl mx-auto space-y-5">
         <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
           <div>
-            <h1 className="text-3xl md:text-5xl font-bold tracking-tight">Forex Chart Analysis Practice</h1>
+            <h1 className="text-3xl md:text-5xl font-bold tracking-tight">Chart Reading Gym</h1>
             <p className="text-slate-400 mt-2 max-w-2xl">
-              Practice with real Twelve Data OHLC candles or demo replay. Mark bias, liquidity, structure, POI, entry, invalidation, and target — then reveal the model breakdown and compare against the A+ score engine.
+              Train one chart-reading skill at a time: liquidity, structure, POI, execution, then the full read.
             </p>
           </div>
           <div className="flex flex-col items-end gap-2">
             <div className="rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/20 px-4 py-2 w-fit">
-              {filled}/7 checklist complete
+              {drillFilled}/{activeDrill.fields.length} drill fields complete
             </div>
             <div className={`rounded-full px-4 py-2 w-fit text-sm font-semibold ${gradeBadgeClasses(score.grade)}`}>
               {score.grade} ({score.total}/100)
@@ -604,13 +657,29 @@ export default function ForexChartPractice() {
         </div>
 
         <Card>
-          <div className="mb-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-amber-100">
-            <div className="font-semibold mb-1">Live Replay Mode (Twelve Data)</div>
-            <div className="text-xs mt-1 opacity-80">
-              Current mode: {dataMode === "demo" ? "Demo candles" : liveLoading ? "Loading live candles..." : liveError ? "Live mode (error - using demo)" : liveSource ? (liveSource === "twelvedata" ? "Live feed (Twelve Data)" : liveSource.startsWith("stooq") ? ("Live feed (Stooq backup) — " + liveSource) : liveSource.startsWith("yahoo") ? ("Live feed (Yahoo backup) — " + liveSource) : ("Live feed — " + liveSource)) : "Live feed"}
+          <div className="mb-4 grid grid-cols-1 lg:grid-cols-[1.5fr_1fr] gap-3">
+            <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+              <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">Drill mode</div>
+              <div className="flex flex-wrap gap-2">
+                {DRILLS.map((drill) => (
+                  <button
+                    key={drill.id}
+                    type="button"
+                    onClick={() => setDrillMode(drill.id)}
+                    className={`rounded-xl px-3 py-2 text-sm font-semibold border transition ${drillMode === drill.id ? "bg-indigo-600 border-indigo-500 text-white" : "bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800"}`}
+                  >
+                    {drill.label}
+                  </button>
+                ))}
+              </div>
+              <div className="mt-3 text-sm text-slate-400">{activeDrill.focus}</div>
             </div>
-            <div className="text-sm text-amber-200/90 mt-1">
-              Click "Switch to Live Mode" to load real OHLC candles from Twelve Data via /.netlify/functions/forex-data and replay them candle by candle.
+            <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-amber-100">
+              <div className="font-semibold mb-1">Replay feed</div>
+              <div className="text-xs mt-1 opacity-80">
+                {dataMode === "demo" ? "Demo candles" : liveLoading ? "Loading live candles..." : liveError ? "Live mode error, using demo" : liveSource ? (liveSource === "twelvedata" ? "Live feed: Twelve Data" : liveSource.startsWith("stooq") ? ("Live feed: Stooq backup") : liveSource.startsWith("yahoo") ? ("Live feed: Yahoo backup") : ("Live feed: " + liveSource)) : "Live feed"}
+              </div>
+              <div className="text-sm text-amber-200/90 mt-1">Replay candles one chunk at a time, then reveal the model after your read.</div>
             </div>
             {liveNotice && !liveError ? (
               <div className="mt-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-amber-200 text-sm">
@@ -675,31 +744,34 @@ export default function ForexChartPractice() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
           <Card>
             <div className="flex items-center justify-between mb-4">
-              <h2 className="text-2xl font-semibold">Your Analysis Checklist</h2>
+              <div>
+                <h2 className="text-2xl font-semibold">Your Rep</h2>
+                <div className="text-sm text-slate-400 mt-1">{activeDrill.label} drill · answer before reveal</div>
+              </div>
               <div className={`rounded-full px-3 py-1 text-sm font-semibold ${gradeBadgeClasses(score.grade)}`}>
                 {score.grade} · {score.total}/100
               </div>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {[
-                ["bias", "Market bias"],
-                ["trend", "Trend / structure"],
-                ["liquidity", "Liquidity swept or targeted"],
-                ["poi", "POI / zone"],
-                ["entry", "Entry trigger"],
-                ["invalidation", "Invalidation"],
-                ["target", "Target"],
-              ].map(([field, label]) => (
+              {activeFields.map(([field, label]) => (
                 <div key={field}>
                   <label className="text-sm text-slate-400">{label}</label>
                   <textarea
                     value={checklist[field]}
                     onChange={(e) => updateChecklist(field, e.target.value)}
-                    placeholder="Type what you see..."
+                    placeholder={field === "entry" ? "What would make this tradable?" : "Type what you see..."}
                     className="mt-1 w-full min-h-[76px] rounded-xl bg-slate-950 border border-slate-700 p-3 text-sm outline-none focus:border-indigo-400"
                   />
                 </div>
               ))}
+            </div>
+            <div className="mt-4 rounded-2xl bg-slate-950 border border-slate-800 p-3">
+              <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">Coach feedback</div>
+              <div className="space-y-2">
+                {feedback.map((tip) => (
+                  <div key={tip} className="text-sm text-slate-300">{tip}</div>
+                ))}
+              </div>
             </div>
             <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
               {[
