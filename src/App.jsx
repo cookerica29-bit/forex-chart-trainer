@@ -1,4 +1,5 @@
-import React, { useMemo, useState, useEffect } from "react";
+import React, { useMemo, useState, useEffect, useRef } from "react";
+import { CandlestickSeries, ColorType, CrosshairMode, LineStyle, createChart } from "lightweight-charts";
 
 const PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "GBPJPY"];
 const SESSIONS = ["Asia", "London", "New York"];
@@ -19,6 +20,13 @@ const CHECKLIST_FIELDS = [
   ["invalidation", "Invalidation"],
   ["target", "Target"],
 ];
+const MARK_TOOLS = [
+  { id: "liquidity", label: "Liquidity", color: "#60a5fa" },
+  { id: "poi", label: "POI", color: "#a78bfa" },
+  { id: "entry", label: "Entry", color: "#22c55e" },
+  { id: "stop", label: "Stop", color: "#ef4444" },
+  { id: "target", label: "Target", color: "#f59e0b" },
+];
 
 const YAHOO_SYMBOL = {
   EURUSD: "EURUSD=X",
@@ -34,6 +42,12 @@ const YAHOO_INTERVAL = {
   "1H": "60m",
   "4H": "4h",
 };
+const NETLIFY_ORIGIN = "https://bespoke-palmier-04dd07.netlify.app";
+
+function functionsBaseUrl() {
+  if (typeof window === "undefined") return "";
+  return window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" ? NETLIFY_ORIGIN : "";
+}
 
 function seededRandom(seed) {
   const x = Math.sin(seed) * 10000;
@@ -69,7 +83,7 @@ async function fetchYahooFinanceData(pair, timeframe) {
   const cached = liveCacheGet(cacheKey);
   if (cached) return { ...cached, cached: true };
 
-  const url = "/.netlify/functions/forex-data?symbol=" + encodeURIComponent(symbol) +
+  const url = functionsBaseUrl() + "/.netlify/functions/forex-data?symbol=" + encodeURIComponent(symbol) +
     "&interval=" + encodeURIComponent(interval);
   let res;
   try {
@@ -180,6 +194,8 @@ function makeScenario(pair, session, timeframe, seed = 12) {
       };
   return {
     data,
+    mode: "sample",
+    hasModel: true,
     answer,
     levels: {
       high: Number(high.toFixed(precision)),
@@ -368,6 +384,7 @@ function buildFeedback({ checklist, scenario, score, drillMode }) {
 }
 
 function gradeBadgeClasses(grade) {
+  if (grade === "Live Rep") return "bg-sky-500/15 text-sky-200 border border-sky-500/25";
   if (grade === "A+ Setup") return "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30";
   if (grade === "A Setup") return "bg-emerald-500/15 text-emerald-200 border border-emerald-500/25";
   if (grade === "B Setup") return "bg-amber-500/15 text-amber-200 border border-amber-500/25";
@@ -408,84 +425,158 @@ function Card({ children }) {
   return <div className="bg-slate-900/85 border border-slate-800 rounded-2xl shadow-xl p-4 md:p-5">{children}</div>;
 }
 
-function CandlestickChart({ data, pair, levels, zones, showLevels, showAnswer }) {
-  const width = 1200;
-  const height = 430;
-  const margin = { top: 24, right: 76, bottom: 34, left: 18 };
-  const chartW = width - margin.left - margin.right;
-  const chartH = height - margin.top - margin.bottom;
-  const precision = decimalsFor(pair);
-  const allHighs = data.map((d) => d.high);
-  const allLows = data.map((d) => d.low);
-  const maxPrice = Math.max(...allHighs, levels.high);
-  const minPrice = Math.min(...allLows, levels.low);
-  const padding = (maxPrice - minPrice) * 0.12 || 1;
-  const topPrice = maxPrice + padding;
-  const bottomPrice = minPrice - padding;
-  const xFor = (index) => margin.left + (index / Math.max(data.length - 1, 1)) * chartW;
-  const yFor = (price) => margin.top + ((topPrice - price) / (topPrice - bottomPrice)) * chartH;
-  const candleW = Math.max(4, Math.min(12, chartW / data.length * 0.58));
-  const ticks = Array.from({ length: 5 }, (_, i) => bottomPrice + ((topPrice - bottomPrice) * i) / 4).reverse();
-  const zoneRect = (start, end, label, className) => {
-    const visibleStart = Math.max(start, 0);
-    const visibleEnd = Math.min(end, data.length - 1);
-    if (visibleStart >= data.length || visibleEnd <= 0 || visibleEnd <= visibleStart) return null;
-    const x = xFor(visibleStart);
-    const w = Math.max(0, xFor(visibleEnd) - x);
-    return (
-      <g>
-        <rect x={x} y={margin.top} width={w} height={chartH} className={className} rx="8" strokeWidth="1" />
-        <text x={x + 8} y={margin.top + 22} fill="#cbd5e1" fontSize="13">{label}</text>
-      </g>
-    );
+function timeForCandle(candle, index) {
+  if (typeof candle.time === "number") return candle.time;
+  const raw = String(candle.time || "");
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) {
+    const parsed = Date.parse(raw.replace(" ", "T") + (raw.includes("Z") ? "" : "Z"));
+    if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
+  }
+  return Math.floor(Date.UTC(2026, 0, 1, 0, 0, 0) / 1000) + index * 15 * 60;
+}
+
+function CandlestickChart({ data, pair, levels, zones, showLevels, showAnswer, marks, activeMarkTool, onAddMark }) {
+  const containerRef = useRef(null);
+  const chartRef = useRef(null);
+  const seriesRef = useRef(null);
+  const priceLinesRef = useRef([]);
+  const markLinesRef = useRef([]);
+  const chartData = useMemo(
+    () => data.map((d, index) => ({
+      time: timeForCandle(d, index),
+      open: d.open,
+      high: d.high,
+      low: d.low,
+      close: d.close,
+    })),
+    [data]
+  );
+  const hasData = chartData.length > 0;
+
+  useEffect(() => {
+    if (!containerRef.current) return undefined;
+    const chart = createChart(containerRef.current, {
+      autoSize: true,
+      layout: {
+        background: { type: ColorType.Solid, color: "#020617" },
+        textColor: "#94a3b8",
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+      },
+      grid: {
+        vertLines: { color: "rgba(30, 41, 59, 0.75)" },
+        horzLines: { color: "rgba(30, 41, 59, 0.75)" },
+      },
+      crosshair: { mode: CrosshairMode.Normal },
+      rightPriceScale: { borderColor: "#334155", scaleMargins: { top: 0.08, bottom: 0.08 } },
+      timeScale: { borderColor: "#334155", timeVisible: true, secondsVisible: false },
+    });
+    const series = chart.addSeries(CandlestickSeries, {
+      upColor: "#22c55e",
+      downColor: "#ef4444",
+      borderUpColor: "#22c55e",
+      borderDownColor: "#ef4444",
+      wickUpColor: "#22c55e",
+      wickDownColor: "#ef4444",
+      priceFormat: { type: "price", precision: decimalsFor(pair), minMove: pair.includes("JPY") ? 0.001 : pair === "XAUUSD" ? 0.01 : 0.00001 },
+    });
+    chartRef.current = chart;
+    seriesRef.current = series;
+    return () => {
+      chart.remove();
+      chartRef.current = null;
+      seriesRef.current = null;
+      priceLinesRef.current = [];
+      markLinesRef.current = [];
+    };
+  }, [pair]);
+
+  useEffect(() => {
+    if (!seriesRef.current || !chartRef.current) return;
+    seriesRef.current.setData(chartData);
+    if (chartData.length > 0) chartRef.current.timeScale().fitContent();
+  }, [chartData]);
+
+  useEffect(() => {
+    if (!seriesRef.current) return;
+    priceLinesRef.current.forEach((line) => seriesRef.current.removePriceLine(line));
+    priceLinesRef.current = [];
+    if (!showLevels || !levels) return;
+    [
+      { price: levels.high, title: "High liquidity", color: "#64748b", style: LineStyle.Dashed },
+      { price: levels.mid, title: "Equilibrium", color: "#475569", style: LineStyle.Dotted },
+      { price: levels.low, title: "Low liquidity", color: "#64748b", style: LineStyle.Dashed },
+    ].forEach((level) => {
+      priceLinesRef.current.push(seriesRef.current.createPriceLine({
+        price: level.price,
+        color: level.color,
+        lineWidth: 1,
+        lineStyle: level.style,
+        axisLabelVisible: true,
+        title: level.title,
+      }));
+    });
+  }, [levels, showLevels]);
+
+  useEffect(() => {
+    if (!seriesRef.current) return;
+    markLinesRef.current.forEach((line) => seriesRef.current.removePriceLine(line));
+    markLinesRef.current = [];
+    marks.forEach((mark) => {
+      markLinesRef.current.push(seriesRef.current.createPriceLine({
+        price: mark.price,
+        color: mark.color,
+        lineWidth: 2,
+        lineStyle: mark.tool === "poi" ? LineStyle.Dotted : LineStyle.Solid,
+        axisLabelVisible: true,
+        title: mark.label,
+      }));
+    });
+  }, [marks]);
+
+  const handleChartClick = (event) => {
+    if (!activeMarkTool || !seriesRef.current || !containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const y = event.clientY - rect.top;
+    const price = seriesRef.current.coordinateToPrice(y);
+    if (price == null || !Number.isFinite(price)) return;
+    onAddMark(Number(price));
   };
+
+  const zoneStyle = showAnswer && zones
+    ? {
+        left: `${Math.max(0, (zones.poiStart / Math.max(data.length - 1, 1)) * 100)}%`,
+        width: `${Math.max(4, ((zones.poiEnd - zones.poiStart) / Math.max(data.length - 1, 1)) * 100)}%`,
+      }
+    : null;
+
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-full rounded-2xl bg-slate-950">
-      <rect x="0" y="0" width={width} height={height} fill="#020617" />
-      {ticks.map((tick) => (
-        <g key={tick}>
-          <line x1={margin.left} x2={width - margin.right + 18} y1={yFor(tick)} y2={yFor(tick)} stroke="#1e293b" strokeDasharray="5 5" />
-          <text x={width - margin.right + 24} y={yFor(tick) + 4} fill="#94a3b8" fontSize="14">
-            {tick.toFixed(precision === 5 ? 4 : precision)}
-          </text>
-        </g>
-      ))}
-      {data.filter((_, i) => i % 12 === 0).map((d) => (
-        <g key={d.index}>
-          <line x1={xFor(d.index)} x2={xFor(d.index)} y1={margin.top} y2={height - margin.bottom} stroke="#1e293b" strokeDasharray="5 5" />
-          <text x={xFor(d.index) - 18} y={height - 10} fill="#94a3b8" fontSize="13">{d.time}</text>
-        </g>
-      ))}
-      {showAnswer ? zoneRect(zones.poiStart, zones.poiEnd, zones.poiLabel, zones.poiClass) : null}
-      {showLevels ? (
-        <g>
-          <line x1={margin.left} x2={width - margin.right + 18} y1={yFor(levels.high)} y2={yFor(levels.high)} stroke="#64748b" strokeDasharray="8 6" />
-          <text x={width - margin.right - 110} y={yFor(levels.high) - 8} fill="#94a3b8" fontSize="13">High liquidity</text>
-          <line x1={margin.left} x2={width - margin.right + 18} y1={yFor(levels.low)} y2={yFor(levels.low)} stroke="#64748b" strokeDasharray="8 6" />
-          <text x={width - margin.right - 105} y={yFor(levels.low) + 18} fill="#94a3b8" fontSize="13">Low liquidity</text>
-          <line x1={margin.left} x2={width - margin.right + 18} y1={yFor(levels.mid)} y2={yFor(levels.mid)} stroke="#475569" strokeDasharray="4 6" />
-          <text x={width / 2 - 38} y={yFor(levels.mid) - 8} fill="#94a3b8" fontSize="13">Equilibrium</text>
-        </g>
+    <div className="relative w-full h-full rounded-2xl overflow-hidden bg-slate-950 border border-slate-800">
+      <div ref={containerRef} onClick={handleChartClick} className={`absolute inset-0 ${activeMarkTool ? "cursor-crosshair" : ""}`} />
+      <div className="absolute left-3 top-3 rounded-lg bg-slate-950/80 border border-slate-800 px-3 py-2 text-xs text-slate-300 pointer-events-none">
+        {pair} · {data.length} bars
+      </div>
+      {!hasData ? (
+        <div className="absolute inset-0 flex items-center justify-center bg-slate-950">
+          <div className="rounded-2xl border border-slate-800 bg-slate-900/85 px-5 py-4 text-center">
+            <div className="text-slate-100 font-semibold">Waiting for real market candles</div>
+            <div className="text-slate-400 text-sm mt-1">Use sample mode only when you intentionally want generated practice.</div>
+          </div>
+        </div>
       ) : null}
-      {data.map((d) => {
-        const bullish = d.close >= d.open;
-        const color = bullish ? "#22c55e" : "#ef4444";
-        const x = xFor(d.index);
-        const yHigh = yFor(d.high);
-        const yLow = yFor(d.low);
-        const yOpen = yFor(d.open);
-        const yClose = yFor(d.close);
-        const bodyY = Math.min(yOpen, yClose);
-        const bodyH = Math.max(2, Math.abs(yClose - yOpen));
-        return (
-          <g key={d.index}>
-            <line x1={x} x2={x} y1={yHigh} y2={yLow} stroke={color} strokeWidth="1.4" />
-            <rect x={x - candleW / 2} y={bodyY} width={candleW} height={bodyH} fill={bullish ? "#22c55e" : "#ef4444"} stroke={color} rx="1.5" />
-          </g>
-        );
-      })}
-      <rect x={margin.left} y={margin.top} width={chartW} height={chartH} fill="none" stroke="#334155" />
-    </svg>
+      {activeMarkTool ? (
+        <div className="absolute right-3 top-3 rounded-lg bg-indigo-500/15 border border-indigo-400/30 px-3 py-2 text-xs text-indigo-100 pointer-events-none">
+          Click chart to mark {MARK_TOOLS.find((tool) => tool.id === activeMarkTool)?.label}
+        </div>
+      ) : null}
+      {showAnswer && zoneStyle ? (
+        <div
+          className="absolute top-8 bottom-9 rounded-xl border border-emerald-400/30 bg-emerald-500/10 pointer-events-none"
+          style={zoneStyle}
+        >
+          <div className="px-3 py-2 text-xs font-semibold text-emerald-200">{zones.poiLabel}</div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -500,7 +591,10 @@ export default function ForexChartPractice() {
   const [showAnswer, setShowAnswer] = useState(false);
   const [checklist, setChecklist] = useState(blankChecklist);
   const [drillMode, setDrillMode] = useState("full");
-  const [dataMode, setDataMode] = useState("demo");
+  const [activeMarkTool, setActiveMarkTool] = useState("liquidity");
+  const [marks, setMarks] = useState([]);
+  const [repCount, setRepCount] = useState(1);
+  const [dataMode, setDataMode] = useState("live");
   const [liveData, setLiveData] = useState(null);
   const [liveLoading, setLiveLoading] = useState(false);
   const [liveError, setLiveError] = useState(null);
@@ -511,7 +605,26 @@ export default function ForexChartPractice() {
   const demoScenario = useMemo(() => makeScenario(pair, session, timeframe, seed), [pair, session, timeframe, seed]);
 
   const scenario = useMemo(() => {
-    if (dataMode !== "live" || !liveData || liveData.length === 0) return demoScenario;
+    if (dataMode !== "live") return demoScenario;
+    if (!liveData || liveData.length === 0) {
+      return {
+        data: [],
+        mode: "live",
+        hasModel: false,
+        answer: {
+          bias: "Read the real chart first. No generated answer is attached to live replay yet.",
+          trend: "Mark the structure you see: BOS, CHoCH, HH/HL, or LH/LL.",
+          liquidity: "Mark the highs/lows price is likely targeting or has swept.",
+          poi: "Mark the premium/discount zone, OB, FVG, supply, or demand area you would study.",
+          entry: "Write what confirmation you would need before entry.",
+          invalidation: "Mark the level that proves your idea wrong.",
+          target: "Mark the next logical liquidity target.",
+          verdict: "This is a real-market rep. Your job is to train the read, then review it manually.",
+        },
+        levels: null,
+        zones: null,
+      };
+    }
     const precision = decimalsFor(pair);
     const high = Math.max(...liveData.map((d) => d.high));
     const low = Math.min(...liveData.map((d) => d.low));
@@ -519,22 +632,44 @@ export default function ForexChartPractice() {
     const reindexed = liveData.map((d, i) => ({ ...d, index: i }));
     return {
       data: reindexed,
-      answer: demoScenario.answer,
+      mode: "live",
+      hasModel: false,
+      answer: {
+        bias: "No canned answer for real-market replay.",
+        trend: "Compare your structure read against the candles after the reveal.",
+        liquidity: "Did price seek the liquidity you marked?",
+        poi: "Did your zone cause displacement or did price cut through it?",
+        entry: "Would your confirmation have kept you out of a poor entry?",
+        invalidation: "Was your invalidation placed beyond meaningful structure?",
+        target: "Was your target the next clean liquidity pool?",
+        verdict: "Save the rep mentally as clean, unclear, or avoid.",
+      },
       levels: {
         high: Number(high.toFixed(precision)),
         low: Number(low.toFixed(precision)),
         mid: Number(mid.toFixed(precision)),
       },
-      zones: demoScenario.zones,
+      zones: null,
     };
   }, [dataMode, liveData, demoScenario, pair]);
 
   const visibleData = scenario.data.slice(0, visibleBars);
-  const score = useMemo(() => scoreSetup({ checklist, scenario, session, timeframe }), [checklist, scenario, session, timeframe]);
+  const score = useMemo(() => scenario.hasModel ? scoreSetup({ checklist, scenario, session, timeframe }) : {
+    components: { htfBias: 0, liquidity: 0, poi: 0, displacement: 0, sessionTiming: 0, entryConfirmation: 0, rrQuality: 0 },
+    total: 0,
+    grade: "Live Rep",
+  }, [checklist, scenario, session, timeframe]);
   const activeDrill = DRILLS.find((drill) => drill.id === drillMode) || DRILLS[0];
   const activeFields = CHECKLIST_FIELDS.filter(([field]) => activeDrill.fields.includes(field));
   const drillFilled = activeDrill.fields.filter((field) => checklist[field]).length;
-  const feedback = useMemo(() => buildFeedback({ checklist, scenario, score, drillMode }), [checklist, scenario, score, drillMode]);
+  const feedback = useMemo(() => scenario.hasModel
+    ? buildFeedback({ checklist, scenario, score, drillMode })
+    : [
+        "Real-market mode: mark first, then replay forward to see whether price respected your levels.",
+        "Focus on whether your liquidity and POI marks were obvious before the move, not after it.",
+        "Use Sample Mode only when you want a guided answer key.",
+      ],
+  [checklist, scenario, score, drillMode]);
 
   useEffect(() => {
     if (dataMode !== "live") return undefined;
@@ -610,25 +745,44 @@ export default function ForexChartPractice() {
 
   const resetScenario = () => {
     setSeed((current) => current + 19);
+    setRepCount((current) => current + 1);
     setVisibleBars(62);
     setPlaying(false);
     setShowAnswer(false);
     setChecklist(blankChecklist);
+    setMarks([]);
   };
 
   const updateChecklist = (field, value) => {
     setChecklist((current) => ({ ...current, [field]: value }));
   };
 
+  const addMark = (price) => {
+    const tool = MARK_TOOLS.find((item) => item.id === activeMarkTool);
+    if (!tool) return;
+    setMarks((current) => [
+      ...current,
+      {
+        id: `${tool.id}-${Date.now()}-${current.length}`,
+        tool: tool.id,
+        label: tool.label,
+        color: tool.color,
+        price,
+      },
+    ]);
+  };
+
   const toggleDataMode = () => {
     setDataMode((current) => {
-      const next = current === "demo" ? "live" : "demo";
-      if (next === "demo") {
+      const next = current === "sample" ? "live" : "sample";
+      if (next === "sample") {
         setLiveData(null);
         setLiveError(null);
         setLiveErrorDetail(null);
         setLiveSource(null);
       }
+      setMarks([]);
+      setChecklist(blankChecklist);
       setVisibleBars(62);
       setPlaying(false);
       setShowAnswer(false);
@@ -637,18 +791,18 @@ export default function ForexChartPractice() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 p-4 md:p-8">
-      <div className="max-w-7xl mx-auto space-y-5">
+    <div className="min-h-screen bg-slate-950 text-slate-100 p-3 md:p-5">
+      <div className="max-w-[1800px] mx-auto space-y-4">
         <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
           <div>
-            <h1 className="text-3xl md:text-5xl font-bold tracking-tight">Chart Reading Gym</h1>
+            <h1 className="text-3xl md:text-5xl font-bold tracking-tight">Real Market Chart Gym</h1>
             <p className="text-slate-400 mt-2 max-w-2xl">
-              Train one chart-reading skill at a time: liquidity, structure, POI, execution, then the full read.
+              Replay real candles, mark the chart, and train the exact things your eyes need to see.
             </p>
           </div>
           <div className="flex flex-col items-end gap-2">
             <div className="rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/20 px-4 py-2 w-fit">
-              {drillFilled}/{activeDrill.fields.length} drill fields complete
+              Rep {repCount} · {drillFilled}/{activeDrill.fields.length} fields
             </div>
             <div className={`rounded-full px-4 py-2 w-fit text-sm font-semibold ${gradeBadgeClasses(score.grade)}`}>
               {score.grade} ({score.total}/100)
@@ -675,11 +829,11 @@ export default function ForexChartPractice() {
               <div className="mt-3 text-sm text-slate-400">{activeDrill.focus}</div>
             </div>
             <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-amber-100">
-              <div className="font-semibold mb-1">Replay feed</div>
+              <div className="font-semibold mb-1">Market feed</div>
               <div className="text-xs mt-1 opacity-80">
-                {dataMode === "demo" ? "Demo candles" : liveLoading ? "Loading live candles..." : liveError ? "Live mode error, using demo" : liveSource ? (liveSource === "twelvedata" ? "Live feed: Twelve Data" : liveSource.startsWith("stooq") ? ("Live feed: Stooq backup") : liveSource.startsWith("yahoo") ? ("Live feed: Yahoo backup") : ("Live feed: " + liveSource)) : "Live feed"}
+                {dataMode === "sample" ? "Generated sample mode" : liveLoading ? "Loading real candles..." : liveError ? "Real candles unavailable" : liveSource ? (liveSource === "twelvedata" ? "Real feed: Twelve Data" : liveSource.startsWith("stooq") ? ("Real feed: Stooq backup") : liveSource.startsWith("yahoo") ? ("Real feed: Yahoo backup") : ("Real feed: " + liveSource)) : "Real feed"}
               </div>
-              <div className="text-sm text-amber-200/90 mt-1">Replay candles one chunk at a time, then reveal the model after your read.</div>
+              <div className="text-sm text-amber-200/90 mt-1">{dataMode === "sample" ? "Sample mode has a guided answer key. It is not real market data." : "Real mode has no fake answer key. Mark first, replay forward, then self-review."}</div>
             </div>
             {liveNotice && !liveError ? (
               <div className="mt-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-amber-200 text-sm">
@@ -708,13 +862,30 @@ export default function ForexChartPractice() {
             <Button onClick={() => setShowLevels((current) => !current)} variant="secondary">
               {showLevels ? "Hide Levels" : "Show Levels"}
             </Button>
-            <Button onClick={resetScenario}>New Chart</Button>
+            <Button onClick={resetScenario}>Next Rep</Button>
             <Button onClick={toggleDataMode} variant="secondary">
-              {dataMode === "demo" ? "Switch to Live Mode" : "Using Live Mode"}
+              {dataMode === "sample" ? "Use Real Candles" : "Use Sample Mode"}
             </Button>
           </div>
 
-          <div className="h-[430px] w-full rounded-2xl bg-slate-950 p-3 border border-slate-800 overflow-hidden">
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <div className="text-xs uppercase tracking-wide text-slate-500 mr-1">Mark</div>
+            {MARK_TOOLS.map((tool) => (
+              <button
+                key={tool.id}
+                type="button"
+                onClick={() => setActiveMarkTool(tool.id)}
+                className={`rounded-xl px-3 py-2 text-sm font-semibold border transition ${activeMarkTool === tool.id ? "bg-slate-100 text-slate-950 border-slate-100" : "bg-slate-950 text-slate-300 border-slate-800 hover:bg-slate-900"}`}
+              >
+                <span style={{ color: activeMarkTool === tool.id ? "#020617" : tool.color }}>{tool.label}</span>
+              </button>
+            ))}
+            <Button onClick={() => setActiveMarkTool(null)} variant="secondary">Cursor</Button>
+            <Button onClick={() => setMarks([])} variant="secondary">Clear Marks</Button>
+            <div className="text-xs text-slate-500">{marks.length} mark{marks.length === 1 ? "" : "s"}</div>
+          </div>
+
+          <div className="h-[62vh] min-h-[520px] w-full rounded-2xl bg-slate-950 p-2 border border-slate-800 overflow-hidden">
             <CandlestickChart
               data={visibleData}
               pair={pair}
@@ -722,6 +893,9 @@ export default function ForexChartPractice() {
               zones={scenario.zones}
               showLevels={showLevels}
               showAnswer={showAnswer}
+              marks={marks}
+              activeMarkTool={activeMarkTool}
+              onAddMark={addMark}
             />
           </div>
 
@@ -773,6 +947,24 @@ export default function ForexChartPractice() {
                 ))}
               </div>
             </div>
+            <div className="mt-4 rounded-2xl bg-slate-950 border border-slate-800 p-3">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-xs uppercase tracking-wide text-slate-500">Your chart marks</div>
+                <button type="button" onClick={() => setMarks([])} className="text-xs text-slate-400 hover:text-slate-100">Clear</button>
+              </div>
+              {marks.length === 0 ? (
+                <div className="text-sm text-slate-500">Use the mark tools above the chart to place liquidity, POI, entry, stop, and target lines.</div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                  {marks.map((mark) => (
+                    <div key={mark.id} className="rounded-lg border border-slate-800 bg-slate-900/70 px-3 py-2 text-sm">
+                      <div className="font-semibold" style={{ color: mark.color }}>{mark.label}</div>
+                      <div className="text-slate-300">{mark.price.toFixed(decimalsFor(pair))}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
             <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
               {[
                 ["HTF bias", score.components.htfBias],
@@ -800,7 +992,7 @@ export default function ForexChartPractice() {
             </div>
             {!showAnswer ? (
               <div className="rounded-2xl bg-slate-950 border border-slate-800 p-6 text-slate-400">
-                Complete your checklist first. Then reveal the answer and compare your read against the model breakdown.
+                {scenario.hasModel ? "Complete your checklist first. Then reveal the answer and compare your read against the model breakdown." : "Real-market reps do not use generated answers. Mark your read, reveal more candles, then judge whether price confirmed or invalidated your idea."}
               </div>
             ) : (
               <div className="space-y-3">
